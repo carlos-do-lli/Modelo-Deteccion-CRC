@@ -1,0 +1,1038 @@
+---
+title: "Codigo del Modelo"
+author: "Carlos Domínguez Llidó"
+date: "2025/2026"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+# install.packages("renv")
+renv::restore()
+```
+
+
+# Estructura de los Datos
+
+En este trabajo se han usado bases de datos sintéticos con las siguientes variables:
+
+\- paciente: variable string, el identificador del paciente.
+\- toma: variable string, indica la toma a la que pertenecen los datos de la fila.
+\- dia: variable numérica, tiempo transcurrido en días desde el comienzo del seguimiento hasta el análisis.
+\- vaf: variable numérica, nivel de VAF de variantes patógenas detectado en la toma.
+\- dia.tac: variable numérica, tiempo transcurrido en días desde el comienso del seguimiento hasta el TAC.
+\- tac: variable lógica, diagnóstico clínico basado en el TAC.
+
+Además al ser sintéticos los datos podemos añadir las variables latentes del modelo:
+
+\- C: variable lógica, indica la presencia real del tumor.
+\- tc: variable numérica, tiempo en días desde el comienzo del seguimiento hasta la parición del tumor.
+
+Los datos se construyen con la función datos.sinteticos(Np, Nt). Los inputs son: Np, número de pacientes que se desea generar; y Nt, número máximo de tomas por paciente. El código genera Np pacientes con un número de tomas aleatorio entre 1 y Nt.
+
+```{r}
+datos.sinteticos = function(Np, Nt){
+
+  dp = floor(runif(Np, 2, Nt+1))
+  tiempmed = 120 * (0:Nt)
+  dt.sint = tibble()
+
+    sigma = 2.5
+    beta = 0.2
+    sigmab = 0.5
+
+    nu = 0.5
+    delta = 0.075
+
+    zeta = -8
+    xi = -2
+    
+    Gamma0 = 0.1
+  
+  D = NA
+  
+  for (i in 1:Np) {
+    p = as.character(i)
+    
+    b = rnorm(1, mean = 0, sd = sigmab)
+    lambda = exp(zeta + b*xi)
+  
+  
+    for (j in 1:dp[i]) {
+    
+    ## Datos de tiempo
+      toma = paste0("b", j-1)
+      dia = tiempmed[j]
+      dia.tac = dia
+  
+      
+    ## Cáncer Oculto
+      if(j == 1){
+        C = as.logical(rbinom(1, 1, Gamma0))
+        
+        if(C == T){
+          tc = runif(1, -30, 0)
+          
+          slope = beta * (dia - tc)
+        }else{
+          tc = NA
+          slope = 0
+        }
+        
+      }else{
+        dia.ant = tiempmed[j-1]
+        
+        if(C != T){
+          PC = 1 - exp(-lambda * (dia - dia.ant))
+          C = rbinom(1, 1, PC)
+        }
+        
+        if(C == T){
+          if(is.na(tc)){
+            tc = runif(1, dia.ant, dia)
+          }
+            
+          slope = beta * (dia - tc)
+        }else{
+          slope = 0
+        }
+      }
+      
+    ## Vaf
+      mu = nu + b + slope
+      V = rnorm(1, mean = mu, sd = sigma)
+      
+    ## Diagnóstico
+      if(C == F){
+        D = F
+      }else{
+        if(is.na(D) | D != T){
+          PD = 1 - exp(-delta * (dia - tc))
+          D = as.logical(rbinom(1, 1, PD))
+        }
+      }
+      
+    # Guardar
+      fila = tibble(paciente = p, 
+                    toma = toma,
+                    dia = dia,
+                    vaf = V,
+                    dia.tac = dia,
+                    tac = D, C = C, tc = tc)
+      
+      dt.sint = bind_rows(dt.sint, fila)
+    }
+    D = NA
+  }
+  
+  return(dt.sint)
+}
+```
+
+La siguiente función tiene como objetivo preparar los datos para la aplicación del modelo. Devuelve la información del data.frame restructurada con una indexación global con las variables:
+
+\- t: vector global con los dias de los seguimientos
+\- N: indexación global de las tomas
+\- Np: número total de pacientes
+\- dp: vector con el número de tomas por paciente
+\- id.pac: vector global con los identificadores de los pacientes.
+\- dia0.pac: vector con los índices globales del comienzo de los datos de los pacientes.
+\- V: vector con los niveles de VAF de todas las tomas.
+\- D: vector con entradas 1 y 2 haciendo referencia al diagnóstico, negativo y positivo respectivamente, de los pacientes.
+
+```{r}
+extract.data = function(dataset){
+  t = dataset$dia
+  N = length(t)
+  
+  # Pacientes
+  Np = length(unique(dataset$paciente))       # Número de pacientes
+  dp = dataset %>% 
+    group_by(paciente) %>% 
+    summarise(n = n())
+  dp = dp$n       # Número de tomas por paciente
+  id.pac = rep(1:Np, dp)      # Vector para identificar el paciente de la toma
+  dia0.pac = which(dataset$dia == 0)       # Vector con indices que corresponde al primer dia de cada paciente 
+  dia0.pac[length(dia0.pac) + 1] = N + 1    # Para solucionar bucles for
+  
+  # Nivel vaf
+  V = dataset$vaf
+  
+  # Diagnostico
+  D = as.numeric(dataset$tac) + 1
+  
+  return(list(t = t, N = N, Np = Np, dp = dp, id.pac = id.pac, dia0.pac = dia0.pac, V = V, D = D))
+}
+```
+
+# Construcción del modelo
+
+## Código general
+
+A continuación se muestra el código base del modelo con las prior objetivas. En las secciones sobre la predicción aparecen los códigos con las prior usadas en el trabajo.
+
+```{r}
+code_1 = nimbleCode({
+    
+  ## Nivel de Vaf patógeno en la toma
+  
+  for(j in 1:N){
+    V[j] ~ dnorm(mu[j], tau)
+    mu[j] <- nu + b[id.pac[j]] + (C[j]-1) * beta * (t[j] - tc[id.pac[j]])  # Media de cada toma depende de varios factores, varios de ellos propios del paciente
+  }
+  
+  for(i in 1:Np){
+    b[i] ~ dnorm(0, taub) # El nivel basal propio de cada paciente
+  }
+  
+  ## Diagnóstico
+  
+  for(j in 1:N){
+    D[j] ~ dcat(Q[j, C[j], 1:2])
+  }
+  
+  # La probabilidad de diagnosticar el cancer
+  for (i in 1:Np) {
+    for (j in (dia0.pac[i]):(dia0.pac[i+1]-1)) {
+      Q[j, 1, 1] <- 1
+      Q[j, 1, 2] <- 0
+      Q[j, 2, 2] <- 1 - exp(-delta * max(0,(t[j]-tc[i])) )
+      Q[j, 2, 1] <- 1 - Q[j, 2, 2]
+    }
+  }
+  
+  ## Desarrollo del Cancer
+
+  for (i in 1:Np) {
+    C[dia0.pac[i]] ~ dcat(Gamma0[1:2])
+    
+    tC1[dia0.pac[i]] <- -30 * (C[dia0.pac[i]]-1)   # SOLUCION CUANDO COMIENZA EL SEGUIMIENTO CON CÁNCER
+    tC2[dia0.pac[i]] <- t[dia0.pac[i]]*(C[dia0.pac[i]]-1) + 10000*(2-C[dia0.pac[i]])
+    
+    for (j in (dia0.pac[i]+1):(dia0.pac[i+1]-1)) {
+      C[j] ~ dcat(Gamma[j, C[j-1], 1:2])  
+      
+      tC1[j] <- t[j]*(2-C[j]) -30*(C[j] - 1) # cota inferior de tiempo de aparición tumor
+      tC2[j] <- t[j]*(C[j]-1) + 10000*(2-C[j])  # cota superior de tiempo de aparición tumor
+    }
+
+    tlow[i] <- max(tC1[(dia0.pac[i]):(dia0.pac[i+1]-1)])
+    tup[i] <- min(tC2[(dia0.pac[i]):(dia0.pac[i+1]-1)])
+    
+    tcaux[i] ~ dunif(0, 1)
+    tc[i] <- tlow[i] + (tup[i] - tlow[i]) * tcaux[i] # tiempo de aparición es uniforme
+  }
+  
+  for (i in 1:Np) {
+    # para no tener NAs
+    Gamma[dia0.pac[i], 1, 1] <- 1
+    Gamma[dia0.pac[i], 1, 2] <- 0
+    Gamma[dia0.pac[i], 2, 1] <- 0
+    Gamma[dia0.pac[i], 2, 2] <- 1
+    for (j in (dia0.pac[i]+1):(dia0.pac[i+1]-1)) {
+      Gamma[j, 1, 1] <- exp(-lambda[i] * max(0, (t[j] - t[j-1])))
+      Gamma[j, 1, 2] <- 1 - Gamma[j, 1, 1]
+      Gamma[j, 2, 1] <- 0
+      Gamma[j, 2, 2] <- 1
+    }
+    
+    lambda[i] <- exp(zeta + b[i] * xi)  # lambda es el factor de riesgo de cada paciente
+  }
+  
+  ## Hyperpriors
+  ### estudiar con respecto al significado e interpretar
+  
+  sigma ~ dunif(min = h_sigmal, max = h_sigmau)
+  tau <- pow(sigma, -2)
+  
+  beta ~ dunif(min = h_betal, max = h_betau)
+  
+  nu ~ dunif(min = 0, max = h_nuu)
+  
+  sigmab ~ dunif(min = h_sigmabl, max = h_sigmabu)
+  taub <- pow(sigmab, -2)
+  
+  delta ~ dunif(min = h_deltal, max = h_deltau)
+  
+  zeta ~ dunif(min = h_zetal, max = h_zetau)
+  
+  xi ~ dunif(min = h_xil, max = h_xiu)
+  
+  Gamma0[2] ~ dbeta(0.5,0.5)    # prior prob inicial de cancer
+  Gamma0[1] <- 1 - Gamma0[2]
+  
+  })
+```
+
+Y un ejemplo de su aplicación sobre el banco de datos de seguimientos cortos, "DatosPeq.rds":
+
+```{r}
+## Preparación de las variables
+
+dt1 = readRDS("DatosPeq.rds")
+aux = extract.data(dt1)
+  
+data = list(D = aux$D, V = aux$V)
+
+constants = list(
+  t = aux$t, N = aux$N, Np = aux$Np,
+  id.pac = aux$id.pac,
+  dia0.pac = aux$dia0.pac,
+
+  h_sigmal = 0, h_sigmau = 10,
+  h_betal = -3, h_betau = 3,
+  h_nuu = 3,
+  h_sigmabl = 0, h_sigmabu = 10,
+  h_deltal = 0, h_deltau = 20,
+  h_zetal = -15, h_zetau = -5,
+  h_xil = -10, h_xiu = 5
+)
+
+param = c("sigma", "beta", "nu", "sigmab", "delta", "zeta", "xi", "Gamma0")
+
+inits = list(
+  sigma = 1,
+  beta = 0,
+  nu = 0.1,
+  sigmab = 1,
+  delta = 0.1,
+  zeta = -11,
+  xi = 0,
+  b = rep(0, aux$Np), 
+  C = ifelse(aux$D == 2, 2, 1),
+  tcaux = runif(aux$Np),
+  Gamma0 = c(0.9, 0.1)
+)
+
+n.chain = 4
+n.burnin = 5000
+n.iter = 2*n.burnin
+```
+
+### Ejecución y Análisis de Convergencia
+
+Usaremos el paquete \texttt{nimble} para la aplicación del modelo. Después se muestra el código necesario para analizar la convergencia del modelo con indicaciones simplificadas.
+
+```{r}
+tiempo.ex = proc.time()
+
+Modelo = nimbleMCMC(
+  code = code_1,
+  data = data,
+  constants = constants,
+  inits = inits,
+  nchains = n.chain,
+  niter = n.iter,
+  nburnin = n.burnin,
+  monitor = c(param, "C"),
+  summary = T,
+  samplesAsCodaMCMC = T)
+
+tiempo.ex = proc.time() - tiempo.ex
+tiempo.ex = tiempo.ex[3]
+
+
+samples= Modelo$samples
+sim = as.matrix(samples)
+pm = c("sigma", "beta", "nu", "sigmab", "delta", "zeta", "xi")
+```
+
+Trazas del MCMC. Observar que no sean caóticas ni se sobrepongan. Hay que analizar las densidades para ver que las prior sean no informativas.
+
+```{r}
+MCMCtrace(samples, params = pm, pdf = F)
+```
+
+
+Estadístico Gelman-Rubin. Tiene que ser cercano a 1, siendo 1.05 el límite de aceptable. Con esto vemos que las cadenas convergen al mismo punto.
+
+```{r}
+g = gelman.diag(samples[,pm])
+k = kable(round(g$psrf, digits = 3))
+g
+```
+
+Effective Sample Size. Número de muestras verdaderamente independientes. Sirve para ver el número de iteraciones necesarias. Es posible usar arg. thin en runMCMC para reducir el número de itraciones almacenadas, hacer una fracción del total y el número más grande.
+
+```{r}
+e = effectiveSize(samples[,pm])
+kable(round(e))
+```
+
+Cuartiles de las estimaciones.
+
+```{r}
+q = apply(as.matrix(samples)[, pm], 2, quantile, probs = c(0.025, 0.5, 0.975)) %>% round(digits =3)
+rownames(q) = c("$Q_{0.025}$", "Media", "$Q_{0.975}$")
+ k = kable(q)
+ k 
+```
+
+## Análisis de las distribuciones posteriores
+
+Usamos el paquete fitdistrplus para aproximar las distribuciones posteriores resultantes
+
+```{r}
+sim = as.matrix(samples1)
+
+pm[length(pm)] = "Gamma0[2]"
+
+for(prm in pm){
+  m = sim[,prm]
+  descdist(m)
+  title(sub = paste("Análisis de distribución de ", prm))
+}
+```
+
+Hay que comprobar que se cumplen los dominios de las distribuciones, por ejemplo, si quiero ajustar una beta, lnorm o weibull tienen que ser positivos los datos. En caso de no coincidir se usa la función normalizar para transformar el soporte a [0,1].
+
+```{r}
+normalizar = function(x){
+  x = (x - min(x))/(max(x) - min(x))
+  return(x)
+}
+
+apply(sim[,pm], 2, range)
+```
+
+
+```{r warning=FALSE}
+# Estimación de parámetros siguiendo el orden del vector pm
+
+distr = c("gamma", "norm", "norm", "norm", "unif", "beta", "unif", "beta")
+summ = c()
+
+for (i in 1:8) {
+  if(i != 7){
+    print(pm[i])
+    m = sim[,pm[i]]
+    if(distr[i] == "beta" & (max(m) > 1 || min(m) < 0)){
+      m = normalizar(m)
+    }
+    fit = fitdist(m, distr = distr[i])
+    
+    summ[i] = summary(fit)
+    
+    GO = gofstat(fit, fitnames = distr[i])
+    print(paste("GoF = ", GO$chisqpvalue))
+    
+    plot(fit)
+    title(sub = c("Gráfica de ajuste de distribución - ", pm[i]))
+  }
+}
+names(summ) = pm
+```
+
+A continuación el código para comprobar el ajuste de las distribuciones aproximadas. Se introducen los parámetros estimados mediante fitdistrplus en la primera parte del código y genera gráficas comparando los datos de las simulaciones con las distribuciones:
+
+```{r}
+local({
+  muestra = data.frame(sim[,pm])
+  
+n <- 10000
+
+## Distribuciones aproximadas
+    sigma = rnorm(n, mean = 2.5, sd = 0.094)  
+    
+    beta = rnorm(n, mean = 0.2, sd = 0.0007)
+    
+    nu = rnorm(n, mean = 0.7, sd = 0.171)
+
+    sigmab = a*rbeta(n, shape1 = 1.36, shape2 = 3.92)+b   # a = max(m)-min(m) b = min(m)
+    # a = 1.16554 b = 0.02439872
+    delta = rlnorm(n, meanlog = -2.2, sdlog = 0.514)
+    
+    zeta = -rlnorm(n, meanlog = 2.07, sd = 0.05)
+    xi = rnorm(n, mean = -0.39, sd = 4.13)
+  
+
+    Gamma0 = rbeta(n, shape1 = 0.5, shape2 = 1)
+
+
+
+df_sigma <- data.frame(x = sigma)
+df_beta <- data.frame(x = beta)
+df_nu <- data.frame(x = nu)
+df_sigmab <- data.frame(x = sigmab)
+df_delta <- data.frame(x = delta)
+df_zeta <- data.frame(x = zeta)
+df_xi <- data.frame(x = xi)
+df_gamma0 <- data.frame(x = Gamma0)
+
+
+
+p1 <- ggplot(df_sigma, aes(x)) +
+  geom_density(data = muestra, aes(x = sigma), fill = "dodgerblue", color = "black") +
+  geom_density(color = "red") +
+  ggtitle("Sigma")
+
+p2 <- ggplot(df_beta, aes(x)) +
+  geom_density(data = muestra, aes(x = beta), fill = "dodgerblue", color = "black") +
+  geom_density(color = "red") +
+  ggtitle("Beta")
+
+p3 <- ggplot(df_nu, aes(x)) +
+  geom_density(data = muestra, aes(x = nu), fill = "dodgerblue", color = "black") +
+  geom_density(color = "red") +
+  ggtitle("Nu")
+
+p4 <- ggplot(df_sigmab, aes(x)) +
+  geom_density(data = muestra, aes(x = sigmab), fill = "dodgerblue", color = "black") +
+  geom_density(color = "red") +
+  ggtitle("Sigma_b")
+
+p5 <- ggplot(df_delta, aes(x)) +
+  geom_density(data = muestra, aes(x = delta), fill = "dodgerblue", color = "black") +
+  geom_density(color = "red") +
+  ggtitle("Delta")
+
+p6 <- ggplot(df_zeta, aes(x)) +
+  geom_density(data = muestra, aes(x = zeta), fill = "dodgerblue", color = "black") +
+  geom_density(color = "red") +
+  ggtitle("Zeta")
+
+p7 <- ggplot(df_xi, aes(x)) +
+  geom_density(data = muestra, aes(x = xi), fill = "dodgerblue", color = "black") +
+  geom_density(color = "red") +
+  ggtitle("Xi")
+
+p8 <- ggplot(df_gamma0, aes(x)) +
+  geom_density(data = muestra, aes(x = Gamma0.2.), fill = "dodgerblue", color = "black") +
+  geom_density(color = "red") +
+  ggtitle("Gamma0")
+
+(p1 | p2 | p3 | p4) /
+(p5 | p6 | p7 | p8)
+})
+```
+
+
+
+## Predicción
+
+### Preparación de los datos
+
+Para la predicción hemos de restructurar los datos con el fin de aprovechar el mismo data set para analizar las predicciones tanto aisladas como por paciente.
+
+El procedimiento será el siguiente, replicaremos los datos de cada paciente tentas veces como tomas tenga dejando el último nodo D como desconocido, de esta forma conseguimos replicar el seguimiento del paciente.
+
+Primero cargamos los datos de las compilaciones previas con el fin de usar las medias como puntos de inicialización de las cadenas.
+
+```{r}
+Comp = readRDS("MCMC_DatosPeq.rds")
+Modelo = Comp[[1]]
+sim = as.matrix(Modelo$samples)
+
+Test = readRDS("PredDatNew.rds")
+```
+
+```{r}
+Pred = tibble()
+Comparativa = tibble()
+
+pacientes.p = unique(Test$paciente)
+Npp = length(pacientes.p)
+
+tmax = Test %>% count(paciente) %>% arrange(as.numeric(paciente))
+tmax = tmax$n
+
+nod.roc.pac = c()
+
+for (p in 1:Npp) {
+  for (t in 2:tmax[p]) {
+    filas.nuevas = Test %>%
+      filter(paciente == pacientes.p[p]) %>%
+      mutate(paciente = paste(paciente, t, sep = "."))
+    
+    filas.nuevas = filas.nuevas[1:t,]
+    Comparativa = bind_rows(Comparativa, filas.nuevas)
+    
+    filas.nuevas$tac[[t]] = NA
+    Pred = bind_rows(Pred, filas.nuevas)
+    
+    if(t == tmax[p]){
+      nod.roc.pac = c(nod.roc.pac, nrow(Pred))
+    }
+  }
+}
+nod.roc.pac = c(0, nod.roc.pac)
+nodos.a.predecir = which(is.na(Pred$tac))
+```
+
+Usaremos el modelo pero con las distribuciones posteriores como distribuciones prior. Después compararemos la cadena C predicha con los datos recogidos del tac haciendo uso de gráficas ROC.
+
+### MCMC y Análisis de convergencia
+
+En esta sección se encuentran los códigos para la predicción con las distribuciones posteiores resultantes de la palicación del modelo a los dos bancos de datos usados en el trabajo.
+
+Estas predicciones se llaman Predicción 1 y Predicción 2 en el trabajo. En el actual código se trabaja con la Predicción 1.
+
+```{r}
+aux = extract.data(Pred)
+  
+data = list(V = aux$V, D = aux$D)
+
+constants1 = list(
+  t = aux$t, N = aux$N, Np = aux$Np,
+  id.pac = aux$id.pac,
+  dia0.pac = aux$dia0.pac,
+  
+  mean_sigma = 2.44, sd_sigma = 0.01,
+  mean_beta = 0.2, sd_beta = 0.01,
+  shape1_nu = 1.76, shape2_nu = 4.69,
+  meanl_sb = 0.49, sdl_sb = 0.19,
+  h_deltal = 0, h_deltau = 0.6,
+  shape1_zeta = 2, shape2_zeta = 1.23,
+  shape1_xi = 2.95, shape2_xi = 2,
+  
+  zmax = max(sim[,"zeta"]), zmin = min(sim[,"zeta"]),
+  xmax = max(sim[,"xi"]), xmin = min(sim[,"xi"]),
+  nmax = max(sim[,"nu"]), nmin = min(sim[,"nu"])
+)
+
+constants2 = list(
+  t = aux$t, N = aux$N, Np = aux$Np,
+  id.pac = aux$id.pac,
+  dia0.pac = aux$dia0.pac,
+  
+  mean_sigma = 2.5, sd_sigma = 0.094,
+  mean_beta = 0.2, sd_beta = 0.0007,
+  mean_nu = 0.7, sd_nu = 0.171,
+  shape1_sb = 1.36, shape2_sb = 3.92,
+  meanl_d = -2.2, sdl_d = 0.514,
+  meanl_zeta = 2.07, sdl_zeta = 0.05,
+  mean_xi = -0.39, sd_xi = 4.13,
+  
+  sbmax = max(sim[,"sigmab"]), sbmin = min(sim[,"sigmab"])
+)
+
+C = aux$D
+C[which(is.na(C))] = 2
+
+D_init = aux$D
+D_init[nodos.a.predecir] = 1
+
+
+# inicializamos con las medias de las simulaciones
+inits = list(
+  sigma = mean(sim[,"sigma"]),
+  beta = mean(sim[,"beta"]),
+  nu= mean(sim[,"nu"]),
+  sigmab = mean(sim[,"sigmab"]),
+  delta = mean(sim[,"delta"]),
+  zeta = mean(sim[,"zeta"]),
+  xi = mean(sim[,"xi"]),
+  b = rep(0, aux$Np), 
+  C = C,
+  tcaux = runif(aux$Np),
+  Gamma0 = c(0.9, 0.1)
+)
+
+param = c("sigma", "beta", "nu", "sigmab", "zeta", "xi")
+
+n.chain = 4
+n.burnin = 5000
+n.iter = 2*n.burnin
+```
+
+```{r}
+code.pred1 = nimbleCode({
+    
+  ## Nivel de Vaf patógeno en la toma
+  
+  for(j in 1:N){
+    V[j] ~ dnorm(mu[j], tau)
+    mu[j] <- nu + b[id.pac[j]] + (C[j]-1) * beta * (t[j] - tc[id.pac[j]])  # Media de cada toma depende de varios factores, varios de ellos propios del paciente
+  }
+  
+  for(i in 1:Np){
+    b[i] ~ dnorm(0, taub) # El nivel basal propio de cada paciente
+  }
+  
+  ## Diagnóstico
+  
+  for(i in 1:Np){
+    for (j in (dia0.pac[i]):(dia0.pac[i+1]-2)) {
+      D[j] ~ dcat(Q[j, C[j], 1:2])
+    }
+    D[dia0.pac[i+1]-1] <- C[dia0.pac[i+1]-1]
+  }
+  
+  # La probabilidad de diagnosticar el cancer
+  for (i in 1:Np) {
+    for (j in (dia0.pac[i]):(dia0.pac[i+1]-1)) {
+      Q[j, 1, 1] <- 1
+      Q[j, 1, 2] <- 0
+      Q[j, 2, 2] <- 1 - exp(-delta * max(0,(t[j]-tc[i])) )
+      Q[j, 2, 1] <- 1 - Q[j, 2, 2]
+    }
+  }
+  
+  ## Desarrollo del Cancer
+
+  for (i in 1:Np) {
+    C[dia0.pac[i]] ~ dcat(Gamma0[1:2])
+    
+    tC1[dia0.pac[i]] <- -30 * (C[dia0.pac[i]]-1)   # SOLUCION CUANDO COMIENZA EL SEGUIMIENTO CON CÁNCER
+    tC2[dia0.pac[i]] <- t[dia0.pac[i]]*(C[dia0.pac[i]]-1) + 10000*(2-C[dia0.pac[i]])
+    
+    for (j in (dia0.pac[i]+1):(dia0.pac[i+1]-1)) {
+      C[j] ~ dcat(Gamma[j, C[j-1], 1:2])  
+      
+      tC1[j] <- t[j]*(2-C[j]) -30*(C[j] - 1) # cota inferior de tiempo de aparición tumor
+      tC2[j] <- t[j]*(C[j]-1) + 10000*(2-C[j])  # cota superior de tiempo de aparición tumor
+    }
+
+    tlow[i] <- max(tC1[(dia0.pac[i]):(dia0.pac[i+1]-1)])
+    tup[i] <- min(tC2[(dia0.pac[i]):(dia0.pac[i+1]-1)])
+    
+    tcaux[i] ~ dunif(0, 1)
+    tc[i] <- tlow[i] + (tup[i] - tlow[i]) * tcaux[i] # tiempo de aparición es uniforme
+  }
+  
+  for (i in 1:Np) {
+    # para no tener NAs
+    Gamma[dia0.pac[i], 1, 1] <- 1
+    Gamma[dia0.pac[i], 1, 2] <- 0
+    Gamma[dia0.pac[i], 2, 1] <- 0
+    Gamma[dia0.pac[i], 2, 2] <- 1
+    for (j in (dia0.pac[i]+1):(dia0.pac[i+1]-1)) {
+      Gamma[j, 1, 1] <- exp(-lambda[i] * max(0, (t[j] - t[j-1])))
+      Gamma[j, 1, 2] <- 1 - Gamma[j, 1, 1]
+      Gamma[j, 2, 1] <- 0
+      Gamma[j, 2, 2] <- 1
+    }
+    
+    lambda[i] <- exp(zeta + b[i] * xi)  # lambda es el factor de riesgo de cada paciente
+  }
+  
+  ## Hyperpriors
+  ### estudiar con respecto al significado e interpretar
+  
+  sigma ~ dnorm(mean = mean_sigma, sd = sd_sigma)
+  tau <- pow(sigma, -2)
+  
+  beta ~ dnorm(mean = mean_beta, sd = sd_beta)
+  
+  nu_aux ~ dbeta(shape1 = shape1_nu, shape2 = shape2_nu)
+  nu <- (nmax - nmin)*nu_aux + nmin
+  
+  sigmab ~ dlnorm(meanlog = meanl_sb, sdlog = sdl_sb)
+  taub <- pow(sigmab, -2)
+  
+  delta ~ dunif(min = h_deltal, max = h_deltau)
+  
+  z_aux ~ dbeta(shape1 = shape1_zeta, shape2 = shape2_zeta)
+  zeta <- (zmax - zmin)*z_aux + zmin
+  
+  x_aux ~ dbeta(shape1 = shape1_xi, shape2 = shape2_xi)
+  xi <- (xmax - xmin)*x_aux + xmin
+  
+  Gamma0[2] ~ dbeta(0.5,0.5)    # prior prob inicial de cancer
+  Gamma0[1] <- 1 - Gamma0[2]
+  
+  })
+```
+
+```{r}
+code.pred2 = nimbleCode({
+    
+  ## Nivel de Vaf patógeno en la toma
+  
+  for(j in 1:N){
+    V[j] ~ dnorm(mu[j], tau)
+    mu[j] <- nu + b[id.pac[j]] + (C[j]-1) * beta * (t[j] - tc[id.pac[j]])  # Media de cada toma depende de varios factores, varios de ellos propios del paciente
+  }
+  
+  for(i in 1:Np){
+    b[i] ~ dnorm(0, taub) # El nivel basal propio de cada paciente
+  }
+  
+  ## Diagnóstico
+  
+  for(i in 1:Np){
+    for (j in (dia0.pac[i]):(dia0.pac[i+1]-2)) {
+      D[j] ~ dcat(Q[j, C[j], 1:2])
+    }
+    D[dia0.pac[i+1]-1] <- C[dia0.pac[i+1]-1]
+  }
+  
+  # La probabilidad de diagnosticar el cancer
+  for (i in 1:Np) {
+    for (j in (dia0.pac[i]):(dia0.pac[i+1]-1)) {
+      Q[j, 1, 1] <- 1
+      Q[j, 1, 2] <- 0
+      Q[j, 2, 2] <- 1 - exp(-delta * max(0,(t[j]-tc[i])) )
+      Q[j, 2, 1] <- 1 - Q[j, 2, 2]
+    }
+  }
+  
+  ## Desarrollo del Cancer
+
+  for (i in 1:Np) {
+    C[dia0.pac[i]] ~ dcat(Gamma0[1:2])
+    
+    tC1[dia0.pac[i]] <- -30 * (C[dia0.pac[i]]-1)   # SOLUCION CUANDO COMIENZA EL SEGUIMIENTO CON CÁNCER
+    tC2[dia0.pac[i]] <- t[dia0.pac[i]]*(C[dia0.pac[i]]-1) + 10000*(2-C[dia0.pac[i]])
+    
+    for (j in (dia0.pac[i]+1):(dia0.pac[i+1]-1)) {
+      C[j] ~ dcat(Gamma[j, C[j-1], 1:2])  
+      
+      tC1[j] <- t[j]*(2-C[j]) -30*(C[j] - 1) # cota inferior de tiempo de aparición tumor
+      tC2[j] <- t[j]*(C[j]-1) + 10000*(2-C[j])  # cota superior de tiempo de aparición tumor
+    }
+
+    tlow[i] <- max(tC1[(dia0.pac[i]):(dia0.pac[i+1]-1)])
+    tup[i] <- min(tC2[(dia0.pac[i]):(dia0.pac[i+1]-1)])
+    
+    tcaux[i] ~ dunif(0, 1)
+    tc[i] <- tlow[i] + (tup[i] - tlow[i]) * tcaux[i] # tiempo de aparición es uniforme
+  }
+  
+  for (i in 1:Np) {
+    # para no tener NAs
+    Gamma[dia0.pac[i], 1, 1] <- 1
+    Gamma[dia0.pac[i], 1, 2] <- 0
+    Gamma[dia0.pac[i], 2, 1] <- 0
+    Gamma[dia0.pac[i], 2, 2] <- 1
+    for (j in (dia0.pac[i]+1):(dia0.pac[i+1]-1)) {
+      Gamma[j, 1, 1] <- exp(-lambda[i] * max(0, (t[j] - t[j-1])))
+      Gamma[j, 1, 2] <- 1 - Gamma[j, 1, 1]
+      Gamma[j, 2, 1] <- 0
+      Gamma[j, 2, 2] <- 1
+    }
+    
+    lambda[i] <- exp(zeta + b[i] * xi)  # lambda es el factor de riesgo de cada paciente
+  }
+  
+  ## Hyperpriors
+  ### estudiar con respecto al significado e interpretar
+  
+  sigma ~ dnorm(mean = mean_sigma, sd = sd_sigma)
+  tau <- pow(sigma, -2)
+  
+  beta ~ dnorm(mean = mean_beta, sd = sd_beta)
+  
+  nu ~ dnorm(mean = mean_nu, sd = sd_nu)
+  
+  sigmab_aux ~ dbeta(shape1 = shape1_sb, shape2 = shape2_sb)
+  sigmab <- (sbmax - sbmin)*sigmab_aux + sbmin
+  taub <- pow(sigmab, -2)
+  
+  delta ~ dlnorm(meanlog = meanl_d, sdlog = sdl_d)
+  
+  zeta_aux ~ dlnorm(meanlog = meanl_zeta, sdlog = sdl_zeta)
+  zeta <- - zeta_aux
+  
+  xi ~ dnorm(mean = mean_xi, sd = sd_xi)
+  
+  Gamma0[2] ~ dbeta(0.5,0.5)    # prior prob inicial de cancer
+  Gamma0[1] <- 1 - Gamma0[2]
+  
+  })
+```
+
+
+```{r}
+
+tiempo.pred = proc.time()
+
+mcmc.pred = nimbleMCMC(
+  code = code.pred1,   #### CAMBIAR CÓDIGO SI SE MODIFICAN LAS PRIORS
+  data = data,
+  constants = constants1,
+  inits = inits,
+  nchains = n.chain,
+  niter = n.iter,
+  nburnin = n.burnin,
+  monitor = c(param, "C"),
+  samplesAsCodaMCMC = T)
+
+tiempo.pred = proc.time() - tiempo.pred
+tiempo.pred = tiempo.pred[3]
+```
+
+Es importante revisar de nuevo la convergencia de las predicciones.
+
+
+## Gráficas ROC
+
+Una vez predichos los nodos faltantes queremos estudiar la especificidad y la sensibilidad de la predicción para seleccionar un punto de corte para el diagnóstico positivo. Basta con cambiar el nombre del archivos con los datos almacenados de la predicción a analizar.
+
+```{r}
+### Creación dataframe con las comparativas
+file = "Pred_DistPeq.rds"
+
+if(file == "Pred_DistMed.rds"){
+  titulo = "Predicción 2"
+}else{
+  titulo = "Predicción 1"
+}
+  
+##############################################################
+# Repetimos código para saber los nodos a predecir
+
+Pred = tibble()
+Comparativa = tibble()
+
+pacientes.p = unique(Test$paciente)
+Npp = length(pacientes.p)
+
+tmax = Test %>% count(paciente) %>% arrange(as.numeric(paciente))
+tmax = tmax$n
+
+nod.roc.pac = c()
+
+for (p in 1:Npp) {
+  for (t in 2:tmax[p]) {
+    filas.nuevas = Test %>%
+      filter(paciente == pacientes.p[p]) %>%
+      mutate(paciente = paste(paciente, t, sep = "."))
+    
+    filas.nuevas = filas.nuevas[1:t,]
+    Comparativa = bind_rows(Comparativa, filas.nuevas)
+    
+    filas.nuevas$tac[[t]] = NA
+    Pred = bind_rows(Pred, filas.nuevas)
+    
+    if(t == tmax[p]){
+      nod.roc.pac = c(nod.roc.pac, nrow(Pred))
+    }
+  }
+}
+nod.roc.pac = c(0, nod.roc.pac)
+nodos.a.predecir = which(is.na(Pred$tac))
+###############################################################
+
+mcmc.pred = readRDS(file)
+simul = as.matrix(mcmc.pred[[1]])  # mean(sim[,"C[5]"]==2) es P(C[5] = 2 | datos)
+
+# estas son son las predicciones de las 20000 iteraciones
+prob.pred.t = simul[,paste0("C[", nodos.a.predecir, "]")] %>% 
+  apply(FUN = mean, MARGIN = 2)
+prob.pred.t = prob.pred.t-1
+
+seg.real = Pred %>% mutate(paciente = str_extract(paciente, "^[^.]+")) %>%  group_by(paciente) %>% summarise(x = ifelse(sum(C)>0, T, F)) %>%  arrange(as.numeric(paciente))
+
+prob.seg = c()
+
+for (i in 2:length(nod.roc.pac)) {
+  v = nod.roc.pac[i-1]:nod.roc.pac[i]
+  colpred = intersect(v, nodos.a.predecir)
+  
+  prob.seg = c(prob.seg, (mean(simul[,paste0("C[", colpred,"]")])-1))
+}
+
+
+df.roc.tomas = tibble(real = as.logical(Comparativa$C[nodos.a.predecir]), prob.mod = prob.pred.t)
+df.roc.pac = tibble(real = seg.real$x, prob.mod = prob.seg)
+
+par(mfrow = c(1,2), pty = "s", oma = c(0,0,1,4))
+
+ROCt = roc(df.roc.tomas, real, prob.mod, plot = F, levels = c(T, F))
+ROCp = roc(df.roc.pac, real, prob.mod, plot = F, levels = c(T,F))
+
+plot.roc(ROCt,
+         col = "dodgerblue3",
+         lwd = 4, legacy.axes = T, ylab = "Sensibilidad", xlab = "1 - Especificidad por toma", grid = T, print.auc = T, print.auc.cex = 1, print.auc.x = 0.5, print.auc.y = 0.2)
+
+pt = coords(ROCt, "best",
+            ret = c("threshold", "sensitivity", "specificity"))
+
+sens = pt["sensitivity"]
+fpr  = pt["specificity"]
+threshold = pt["threshold"]
+
+p5 = coords(ROCt, x = 0.5, input = "threshold", ret = c("threshold", "sensitivity", "specificity"))
+
+sens5 = p5["sensitivity"]
+fpr5  = p5["specificity"]
+threshold5 = p5["threshold"]
+
+points(fpr, sens, col = "firebrick3", pch = 19, cex = 1.5)
+text(fpr, sens - 0.11,
+     labels = paste0(round(threshold, 2)," (", round(sens,2), ", ", round(1-fpr,2), ")"),
+     pos = 4, col = "firebrick3")
+
+
+points(fpr5, sens5, col = "green4", pch = 16, cex = 1.5)
+text(fpr5, sens5 - 0.05,
+     labels = paste0(round(threshold5, 2)," (", round(sens5,2), ", ", round(1-fpr5,2), ")"),
+     pos = 4, col = "green4")
+
+plot.roc(ROCp,
+         col = "dodgerblue3",
+         lwd = 4, legacy.axes = T, ylab = "Sensibilidad", xlab = "1 - Especificidad por paciente", grid = T, print.auc = T, print.auc.cex = 1, print.auc.x = 0.5, print.auc.y = 0.2)
+
+pt = coords(ROCp, "best",
+            ret = c("threshold", "sensitivity", "specificity"), transpose = F)
+
+sens = pt[,"sensitivity"]
+fpr  = pt[,"specificity"]
+threshold = pt[,"threshold"]
+
+p5 = coords(ROCp, x = 0.5, input = "threshold", ret = c("threshold", "sensitivity", "specificity"), transpose = F)
+
+sens5 = p5[,"sensitivity"]
+fpr5  = p5[,"specificity"]
+threshold5 = p5[,"threshold"]
+
+points(fpr, sens, col = "firebrick3", pch = 16, cex = 1.5)
+
+text(fpr, sens - 0.07,
+     labels = paste0(round(threshold, 2)," (", round(sens,2), ", ", round(1-fpr,2), ")"),
+     pos = 4, col = "firebrick3")
+
+points(fpr5, sens5, col = "green4", pch = 15, cex = 1.5)
+text(fpr5+0.7, sens5+0.09,
+     labels = paste0(round(threshold5, 2)," (", round(sens5,2), ", ", round(1-fpr5,2), ")"), pos = 4, col = "green4")
+
+mtext(titulo, side = 3, outer = T, cex = 1.5, font = 2, line = -2)
+
+legend("right",
+       legend = c("Óptimo", "P(C) = 0.5"),
+       col = c("firebrick3", "green4"),
+       pch = c(19, 15),
+       pt.cex = 1,
+       inset = -0.6,
+       horiz = F,
+       bty = "n",
+       xpd = NA)
+```
+
+
+Código para mostrar la probabilidad de las predicciones comparandolas con el verdadero desarrollo de la enfermedad.
+
+```{r warning=FALSE}
+graph = tibble() # paciente toma prob diag
+
+pacientes = unique(Test$paciente) # usaremos el índice del paciente, i \in (1,9)
+
+ind0.pac = which(grepl(".2", Pred$paciente))
+ind0.pac[length(ind0.pac)+1] = ind0.pac[length(ind0.pac)]+1
+
+idx = 1 ##  Hace referencia al nodo de la prediccion
+for (i in 1:15) {
+  P = pacientes[i]
+  tm = tmax[i]
+  pc = NA
+  d = as.numeric(Test$C[Test$paciente == P][1])
+  graph = bind_rows(graph, tibble(Paciente = P, toma = 1, Prob = pc, Diag = d))
+  for (j in 2:tm) {
+    d = as.numeric(dt$C[dt$paciente == P][j])
+    graph = bind_rows(graph, tibble(Paciente = P, toma = j, Prob = prob.pred.t[idx], Diag = d))
+    idx = idx + 1
+  }
+}
+
+graph$Paciente <- factor(graph$Paciente, levels = sort(unique(as.numeric(graph$Paciente))))
+
+rdm = sample(1:15, 9, replace = F)
+graph %>% 
+  filter(Paciente %in% rdm) %>% 
+  ggplot(aes(x = toma, y = Diag)) + geom_point(aes(color = "Cáncer presente")) + geom_line(aes(y = Prob, color = "Prob.Predictiva"), lwd = 1) + geom_point(aes(y = Prob, color = "Prob.Predictiva")) + scale_color_manual(name = "Leyenda", values = c("Cáncer presente" = "firebrick3", "Prob.Predictiva" = "cadetblue4")) + labs(x = "Toma", y = "Probabilidad", title = titulo) + facet_wrap(~Paciente)
+```
+
