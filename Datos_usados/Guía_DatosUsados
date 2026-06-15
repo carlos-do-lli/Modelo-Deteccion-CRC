@@ -1,0 +1,5 @@
+# Guía de Datos_Usados
+En esta carpeta se encunetran los datos necesarios para replicar los reultados del trabajo. Hay tres tipos de archivos, todos '.rds':
+- Datos-.rds: son los datos sintéticos usados en el trabajo. DatosMed son los datos de seguimientos de 10 tomas, DatosPeq de 5 tomas y DatosPred los datos usados para las predicciones.
+- MCMC_-.rds: variable tipo list que contiene las simulaciones del MCMC con las prior objetivas y el tiempo de duración de la compilación, entradas 1 y 2 respectivamente.
+- Pred_Dist-.rds: son archivos similares a MCMC_-.rds pero con los datos de las predicciones. El nombre depende de si se han usado como prior las distribuciones posteriores resultantes de aplicar el modelo a unos datos sintéticos u otros.
