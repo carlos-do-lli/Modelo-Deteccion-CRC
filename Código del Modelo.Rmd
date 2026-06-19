@@ -10,7 +10,7 @@ output:
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = FALSE)
 
-# install.packages("renv")
+install.packages("renv")
 renv::restore()
 ```
 
@@ -359,13 +359,18 @@ Effective Sample Size. Número de muestras verdaderamente independientes. Sirve 
 
 ```{r}
 e = effectiveSize(samples[,pm])
+b = apply(X = sim[,pm], FUN = ess_bulk, MARGIN = 2)
+t = apply(X = sim[,pm], FUN = ess_tail, MARGIN = 2)
+
 kable(round(e))
+kable(round(b))
+kable(round(t))
 ```
 
 Cuartiles de las estimaciones.
 
 ```{r}
-q = apply(as.matrix(samples)[, pm], 2, quantile, probs = c(0.025, 0.5, 0.975)) %>% round(digits =3)
+q = apply(sim[, pm], 2, quantile, probs = c(0.025, 0.5, 0.975)) %>% round(digits =3)
 rownames(q) = c("$Q_{0.025}$", "Media", "$Q_{0.975}$")
  k = kable(q)
  k 
@@ -526,7 +531,7 @@ Comp = readRDS("MCMC_DatosPeq.rds")
 Modelo = Comp[[1]]
 sim = as.matrix(Modelo$samples)
 
-Test = readRDS("DatosPred.rds")
+Test = readRDS("PredDatNew.rds")
 ```
 
 ```{r}
@@ -564,7 +569,7 @@ nodos.a.predecir = which(is.na(Pred$tac))
 
 Usaremos el modelo pero con las distribuciones posteriores como distribuciones prior. Después compararemos la cadena C predicha con los datos recogidos del tac haciendo uso de gráficas ROC.
 
-### MCMC
+### MCMC y Análisis de convergencia
 
 En esta sección se encuentran los códigos para la predicción con las distribuciones posteiores resultantes de la palicación del modelo a los dos bancos de datos usados en el trabajo.
 
@@ -843,7 +848,7 @@ tiempo.pred = proc.time()
 mcmc.pred = nimbleMCMC(
   code = code.pred1,   #### CAMBIAR CÓDIGO SI SE MODIFICAN LAS PRIORS
   data = data,
-  constants = constants1,  #### CUIDADO CON LAS CONSTANTES, DEBEN SER COHERENTES CON EL CÓDIGO
+  constants = constants1,
   inits = inits,
   nchains = n.chain,
   niter = n.iter,
@@ -855,39 +860,7 @@ tiempo.pred = proc.time() - tiempo.pred
 tiempo.pred = tiempo.pred[3]
 ```
 
-Es importante revisar de nuevo la convergencia de las predicciones:
-
-Trazas MCMC.
-
-```{r}
-samples = mcmc.pred$samples
-MCMCtrace(samples, params = pm, pdf = F)
-```
-
-
-Estadístico Gelman-Rubin.
-
-```{r}
-g = gelman.diag(samples[,pm])
-k = kable(round(g$psrf, digits = 3))
-g
-```
-
-Effective Sample Size.
-
-```{r}
-e = effectiveSize(samples[,pm])
-kable(round(e))
-```
-
-Cuartiles de las estimaciones.
-
-```{r}
-q = apply(as.matrix(samples)[, pm], 2, quantile, probs = c(0.025, 0.5, 0.975)) %>% round(digits =3)
-rownames(q) = c("$Q_{0.025}$", "Media", "$Q_{0.975}$")
- k = kable(q)
- k 
-```
+Es importante revisar de nuevo la convergencia de las predicciones.
 
 
 ## Gráficas ROC
